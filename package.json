@@ -1,0 +1,11 @@
+{
+  "name": "ci-cd-demo-app",
+  "version": "1.0.0",
+  "description": "Minimal app for CI/CD pipeline demo",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "lint": "node scripts/lint.js",
+    "test": "node --test"
+  }
+}
