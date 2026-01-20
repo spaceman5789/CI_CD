@@ -1,83 +1,144 @@
 stages:
-  - lint_test
+  - lint
+  - test
   - build
   - scan
   - push
   - deploy
 
 variables:
-  IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
-  IMAGE_LATEST: $CI_REGISTRY_IMAGE:latest
-  STAGING_PATH: /opt/app
+  DOCKER_TLS_CERTDIR: ""
+  DOCKER_DRIVER: overlay2
 
-lint_test:
-  stage: lint_test
-  image: node:20-alpine
+  IMAGE_SHA: "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA"
+  IMAGE_STAGING: "$CI_REGISTRY_IMAGE:staging"
+
+default:
+  interruptible: true
+
+# -----------------------
+# 1) Lint
+# -----------------------
+lint:
+  stage: lint
+  image: python:3.12
   script:
-    - npm run lint
-    - npm test
+    - pip install --no-cache-dir -r requirements.txt
+    - flake8 app.py tests
+  rules:
+    - if: $CI_COMMIT_BRANCH
 
+# -----------------------
+# 2) Unit tests
+# -----------------------
+test:
+  stage: test
+  image: python:3.12
+  script:
+    - pip install --no-cache-dir -r requirements.txt
+    - pytest -q
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+# -----------------------
+# 3) Build Docker image -> artifact image.tar
+# -----------------------
 build_image:
   stage: build
   image: docker:24
   services:
     - name: docker:24-dind
-  variables:
-    DOCKER_HOST: tcp://docker:2375
-    DOCKER_TLS_CERTDIR: ""
+  needs: ["lint", "test"]
   script:
-    - docker build -t "$IMAGE_TAG" -t "$IMAGE_LATEST" .
-    - docker save "$IMAGE_TAG" "$IMAGE_LATEST" -o image.tar
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - docker build
+      --build-arg APP_VERSION="$CI_COMMIT_SHORT_SHA"
+      -t "$IMAGE_SHA"
+      -t "$IMAGE_STAGING"
+      .
+    - docker save "$IMAGE_SHA" "$IMAGE_STAGING" -o image.tar
   artifacts:
     paths:
       - image.tar
-    expire_in: 1 hour
+    expire_in: 1 day
+  rules:
+    - if: $CI_COMMIT_BRANCH
 
-scan_image:
+# -----------------------
+# 4) Trivy scans (fs + image)
+# -----------------------
+trivy_scan:
   stage: scan
-  image: aquasec/trivy:0.49.1
+  image: docker:24
+  services:
+    - name: docker:24-dind
+  needs: ["build_image"]
+  before_script:
+    - apk add --no-cache curl
+    # Install Trivy (official install script)
+    - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
   script:
-    - trivy image --input image.tar --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 --format table | tee trivy-report.txt
-  artifacts:
-    when: always
-    paths:
-      - trivy-report.txt
-  dependencies:
-    - build_image
+    # SCA / repo scan (dependencies + misconfig). Отчёт будет в логах job'a
+    - trivy fs --no-progress --severity HIGH,CRITICAL --exit-code 1 .
+    # Image scan
+    - docker load -i image.tar
+    - trivy image --no-progress --severity HIGH,CRITICAL --exit-code 1 "$IMAGE_SHA"
+  rules:
+    - if: $CI_COMMIT_BRANCH
 
+# -----------------------
+# 5) Push to GitLab Container Registry
+# -----------------------
 push_image:
   stage: push
   image: docker:24
   services:
     - name: docker:24-dind
-  variables:
-    DOCKER_HOST: tcp://docker:2375
-    DOCKER_TLS_CERTDIR: ""
+  needs: ["trivy_scan"]
   script:
-    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
     - docker load -i image.tar
-    - docker push "$IMAGE_TAG"
-    - docker push "$IMAGE_LATEST"
-  dependencies:
-    - build_image
+    - docker push "$IMAGE_SHA"
+    - docker push "$IMAGE_STAGING"
+  rules:
+    - if: $CI_COMMIT_BRANCH
 
+# -----------------------
+# 6) Deploy to staging VM via SSH + docker compose
+# -----------------------
 deploy_staging:
   stage: deploy
   image: alpine:3.19
+  needs: ["push_image"]
+  resource_group: staging
+  environment:
+    name: staging
+    url: $STAGING_URL
   before_script:
-    - apk add --no-cache openssh-client rsync
+    - apk add --no-cache openssh-client
     - eval "$(ssh-agent -s)"
-    - echo "$STAGING_SSH_KEY" | tr -d '\r' | ssh-add -
-    - mkdir -p ~/.ssh
-    - chmod 700 ~/.ssh
-    - ssh-keyscan -H "$STAGING_HOST" >> ~/.ssh/known_hosts
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - ssh-keyscan -p "$STAGING_SSH_PORT" "$STAGING_HOST" >> ~/.ssh/known_hosts
   script:
-    - ssh "$STAGING_USER@$STAGING_HOST" "mkdir -p $STAGING_PATH"
+    # prepare dir
+    - ssh -p "$STAGING_SSH_PORT" "$STAGING_USER@$STAGING_HOST" "mkdir -p '$STAGING_PATH'"
+    # copy compose file
+    - scp -P "$STAGING_SSH_PORT" deploy/docker-compose.yml "$STAGING_USER@$STAGING_HOST:$STAGING_PATH/docker-compose.yml"
+    # write .env with image tag
     - |
-      ssh "$STAGING_USER@$STAGING_HOST" "cat > $STAGING_PATH/.env << 'EOF'
-      $STAGING_ENV_FILE
+      ssh -p "$STAGING_SSH_PORT" "$STAGING_USER@$STAGING_HOST" "cat > '$STAGING_PATH/.env' << 'EOF'
+      IMAGE=$IMAGE_STAGING
       EOF"
-    - rsync -avz deploy/compose/ "$STAGING_USER@$STAGING_HOST:$STAGING_PATH/"
-    - ssh "$STAGING_USER@$STAGING_HOST" "cd $STAGING_PATH && docker compose pull && docker compose up -d"
-  only:
-    - main
+    # registry login on VM (use Deploy Token creds), then deploy
+    - |
+      ssh -p "$STAGING_SSH_PORT" "$STAGING_USER@$STAGING_HOST" "
+        set -e
+        docker login -u '$REGISTRY_USER' -p '$REGISTRY_PASSWORD' '$CI_REGISTRY'
+        cd '$STAGING_PATH'
+        docker compose pull
+        docker compose up -d --remove-orphans
+        docker image prune -f
+      "
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
